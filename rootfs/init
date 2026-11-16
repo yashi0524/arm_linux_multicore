@@ -1,0 +1,12 @@
+#!/bin/busybox sh
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+uname -a
+echo "=== CPU count (per kernel) ==="
+grep -c ^processor /proc/cpuinfo
+mount -t debugfs none /sys/kernel/debug
+echo "=== available tracers ==="
+cat /sys/kernel/debug/tracing/available_tracers
+/ftrace_test.sh
+echo "=== dropping to interactive shell (PID 1) — drive ftrace by hand from here ==="
+exec /bin/sh

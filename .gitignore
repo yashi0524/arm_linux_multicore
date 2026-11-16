@@ -1,0 +1,8 @@
+# Build outputs: kernel tree + tarball, boot-wrapper clones, dtbs, axf, rootfs
+build/
+*.axf
+*.dtb
+*.squashfs
+*.o
+# Host busybox-static copy (rule in Makefile)
+rootfs/bin/busybox
