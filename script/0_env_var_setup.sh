@@ -24,3 +24,13 @@ export LD_LIBRARY_PATH=$HOME/.local/dtc-tools/usr/lib/aarch64-linux-gnu:$LD_LIBR
 # /usr/share/bison; this env var is bison's own escape hatch (verified
 # needed: without it, "cannot open m4sugar.m4" during kbuild's kconfig step).
 export BISON_PKGDATADIR=$HOME/.local/kbuild-tools/usr/share/bison
+
+# UEFI boot flow (default Base RevC boot: `make base` / `make run-base`): EDK2's BaseTools need
+# libuuid headers and its FVP ACPI tables need iasl; mtools is there for
+# poking at FAT images. Same no-root apt-get download + dpkg-deb -x
+# install (uuid-dev, acpica-tools, mtools) into ~/.local/uefi-tools.
+# libuuid.so in that prefix is re-pointed at the host's libuuid.so.1
+# (the .deb's dev symlink is relative and would dangle).
+export PATH=$HOME/.local/uefi-tools/usr/bin:$PATH
+export C_INCLUDE_PATH=$HOME/.local/uefi-tools/usr/include:$C_INCLUDE_PATH
+export LIBRARY_PATH=$HOME/.local/uefi-tools/usr/lib/aarch64-linux-gnu:$LIBRARY_PATH
