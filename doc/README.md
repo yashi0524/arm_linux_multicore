@@ -9,6 +9,32 @@ across every online CPU. Sibling of
 CPU_ON). That project debugs boot from *outside* via Iris; this one
 exercises the kernel's own tracing from *inside* a running kernel.
 
+## Contents
+
+- [Quick start](#quick-start)
+- [Targets](#targets)
+- [Files](#files)
+- [UEFI boot flow (Base RevC default: run-base, verified 2026-11-17)](#uefi-boot-flow-base-revc-default-run-base-verified-2026-11-17)
+  - [Build pieces (Makefile, "UEFI" sections)](#build-pieces-makefile-uefi-sections)
+  - [Stages](#stages)
+  - [Required settings (root-caused live)](#required-settings-root-caused-live)
+- [Base Platform RevC, 2 cores, boot-wrapper (verified 2026-11-16)](#base-platform-revc-2-cores-boot-wrapper-verified-2026-11-16)
+  - [Running the test](#running-the-test)
+  - [Model parameters that are required (root-caused live)](#model-parameters-that-are-required-root-caused-live)
+  - [Base Platform RevC + Iris (make run-base-bwa-debug, make run-base-debug)](#base-platform-revc--iris-make-run-base-bwa-debug-make-run-base-debug)
+- [Boot flow (Base RevC, 2 cores, boot-wrapper: run-base-bwa)](#boot-flow-base-revc-2-cores-boot-wrapper-run-base-bwa)
+  - [0. Image layout (build/bwa-base2/model.lds)](#0-image-layout-buildbwa-base2modellds)
+  - [1. FVP reset](#1-fvp-reset)
+  - [2. boot-wrapper, all CPUs (arch/aarch64/boot.S, common/init.c)](#2-boot-wrapper-all-cpus-archaarch64boots-commoninitc)
+  - [3. Linux on CPU0 (log lines 22–110)](#3-linux-on-cpu0-log-lines-22110)
+  - [4. Secondary bring-up (log lines 111–118)](#4-secondary-bring-up-log-lines-111118)
+  - [5. Rootfs and userspace (log lines 274 onward)](#5-rootfs-and-userspace-log-lines-274-onward)
+  - [Relation to UEFI](#relation-to-uefi)
+- [Foundation Platform, 4 cores](#foundation-platform-4-cores)
+  - [ftrace history: the PL011 input overrun](#ftrace-history-the-pl011-input-overrun)
+- [Setup](#setup)
+- [Notes / gotchas (verified, not assumed)](#notes--gotchas-verified-not-assumed)
+
 ## Quick start
 
 ```bash
@@ -53,11 +79,102 @@ Kernel `Image` and rootfs are shared by all targets.
 | `doc/run_base_2core_ftrace.log` | reference log from a passing boot-wrapper run |
 | `doc/run_uefi_2core_ftrace.log` | reference log from a passing UEFI run (ANSI escapes stripped) |
 
+## UEFI boot flow (Base RevC default: `run-base`, verified 2026-11-17)
+
+```bash
+make base                                            # TF-A + EDK2 + build/uefi/
+script/1_run_base_ftrace.sh [log_file] [timeout_s]   # defaults: build/run_base_ftrace.log, 1200
+```
+Same board, kernel `Image`, dtb and rootfs as `run-base-bwa`. The only
+difference is that boot-wrapper is replaced by the standard Arm firmware
+stack. Wall time is about 55 s;
+roughly 25 s of that is firmware, including the Shell's 5 s
+`startup.nsh` countdown. Line numbers below refer to
+`doc/run_uefi_2core_ftrace.log`.
+
+```
+FVP reset (cpu0 only, EL3)
+ └─ TF-A BL1  (secure flash, bp.secureflashloader = bl1.bin)
+     └─ BL2   (loaded from FIP in NOR flash0, bp.flashloader0 = fip.bin)
+         └─ BL31 (EL3 runtime: PSCI v1.1, GICv3 secure init, counter start)
+             └─ BL33 = EDK2 FVP_AARCH64_EFI.fd  (NS-EL2)
+                 └─ BDS → UEFI Shell (fallback boot option)
+                     └─ startup.nsh on SemihostFs (build/uefi/)
+                         └─ Image dtb=… console=…  (kernel EFI stub)
+                             └─ ExitBootServices → Linux at EL2
+                                 └─ PSCI CPU_ON (SMC → BL31) for CPU1
+```
+
+### Build pieces (`Makefile`, "UEFI" sections)
+
+| Piece | Source | Output |
+|---|---|---|
+| EDK2 | `tianocore/edk2` + `edk2-platforms`, pinned master SHAs (`EDK2_SHA`, `EDK2_PLAT_SHA`) | `build/Build/ArmVExpress-FVP-AArch64/RELEASE_GCC/FV/FVP_AARCH64_EFI.fd` |
+| TF-A | `v2.15.0`, `PLAT=fvp FVP_CLUSTER_COUNT=1 FVP_MAX_CPUS_PER_CLUSTER=2 CTX_INCLUDE_AARCH32_REGS=0 BL33=<EDK2 fd>` | `build/tf-a/build/fvp/release/{bl1,fip}.bin` |
+| Semihosting dir | `Image`, `fvp-base-revc-2core.dtb`, generated `startup.nsh` | `build/uefi/` |
+
+EDK2 build-time host tools (`uuid-dev`, `iasl`) come from
+`~/.local/uefi-tools` (see `script/0_env_var_setup.sh`).
+
+### Stages
+
+1. **TF-A (log lines 23–31).** BL1 → BL2 → BL31. (One earlier run,
+   before the PCD fix below, showed the TF-A banner twice, i.e. one warm
+   reset before EDK2's banner. The passing run shows it once; the cause
+   was not root-caused.) BL31 stays resident at EL3
+   as the PSCI provider and starts the system counter, so no
+   `refcounter` or `pctl.startup` model parameters are needed.
+2. **EDK2 / BDS (line 34).** `Press ESCAPE for boot options`, then the
+   BDS boot timeout expires. No device has a bootable ESP (the virtio
+   disk is a raw squashfs), so BDS boots the embedded UEFI Shell as its
+   fallback.
+3. **Shell (lines 34–59).** After a 5 s countdown, the Shell runs
+   `startup.nsh` from EDK2's SemihostFs, which exposes the model's
+   `semihosting-cwd` (`build/uefi/`).
+4. **EFI stub (lines 61–64).** `Image` is a PE/COFF EFI application
+   (`CONFIG_EFI_STUB=y`). The stub loads the dtb named by `dtb=` from
+   the same volume (`Using DTB from command line`), builds the memory
+   map, calls `ExitBootServices`, and enters the kernel at EL2.
+5. **Linux.** Compared with the boot-wrapper flow:
+   - `efi: EFI v2.7 by EDK II` instead of `UEFI not found`. EFI runtime
+     services are mapped (`Remapping and enabling EFI services`), and
+     `rtc-efi` registers as `rtc0`.
+   - `psci: PSCIv1.1 detected in firmware` (TF-A) instead of
+     boot-wrapper's v0.1 `CPU_ON`/`CPU_OFF` only.
+   - `efi: ACPI 2.0=…` is published by EDK2 but ignored
+     (`CONFIG_ACPI` off). Hardware still comes from our dtb.
+   - `KASLR disabled due to lack of seed` / `EFI_RNG_PROTOCOL
+     unavailable`: the FVP EDK2 build has no RNG protocol.
+   - `Unknown kernel command line parameters "dtb=…"` is harmless. The
+     stub consumes `dtb=`, and the kernel just passes it on to userspace.
+6. **SMP + userspace.** CPU1 is brought up by `PSCI CPU_ON` → BL31,
+   which powers it on through the FVP power controller (line 179). After
+   that, the `/init` → `ftrace_test.sh` flow is the same as for
+   `run-base`.
+
+### Required settings (root-caused live)
+
+- **`PcdUefiShellDefaultBootEnable=TRUE`** (EDK2 `build --pcd`). ArmPkg's
+  `PlatformBootManagerLib` registers the Shell as an *inactive* boot
+  option (hotkey `s` only). Without this PCD, BDS finds nothing to boot,
+  drops to the setup front page ("Device Manager / Boot Manager / …"),
+  and `startup.nsh` never runs.
+- **`CTX_INCLUDE_AARCH32_REGS=0`** (TF-A). With `cluster0.has_arm_v9-0=1`,
+  EL1 is AArch64-only. With the default of 1, BL1 prints `EL1 supports
+  AArch64-only…` and reset-loops forever.
+- **`FVP_CLUSTER_COUNT=1 FVP_MAX_CPUS_PER_CLUSTER=2`** (TF-A) matches
+  the model's `cluster0.NUM_CORES=2 cluster1.NUM_CORES=0` and our dts.
+- **No `-a`, no `pctl.startup`, no `refcounter` param** (model). BL1 is
+  the reset vector, TF-A expects only cpu0 at reset, and TF-A starts the
+  counter itself.
+- `sh: 1: xterm: not found` in the log is harmless. The FVP tries to
+  open terminal windows for UART1–3.
+
 ## Base Platform RevC, 2 cores, boot-wrapper (verified 2026-11-16)
 
 This was the original Base RevC boot. It is now the non-default
 `*-bwa` targets; the default is the UEFI flow (see "UEFI boot flow"
-below).
+above).
 
 ### Running the test
 
@@ -243,98 +360,7 @@ ACPI.
   by a model parameter.
 - The default `base` / `run-base` targets build and boot exactly that firmware
   flow: TF-A (BL1→BL2→BL31) → EDK2 (BL33) → the kernel as an EFI app.
-  See "UEFI boot flow" below.
-
-## UEFI boot flow (Base RevC default: `run-base`, verified 2026-11-17)
-
-```bash
-make base                                            # TF-A + EDK2 + build/uefi/
-script/1_run_base_ftrace.sh [log_file] [timeout_s]   # defaults: build/run_base_ftrace.log, 1200
-```
-Same board, kernel `Image`, dtb and rootfs as `run-base-bwa`. The only
-difference is that boot-wrapper is replaced by the standard Arm firmware
-stack. Wall time is about 55 s;
-roughly 25 s of that is firmware, including the Shell's 5 s
-`startup.nsh` countdown. Line numbers below refer to
-`doc/run_uefi_2core_ftrace.log`.
-
-```
-FVP reset (cpu0 only, EL3)
- └─ TF-A BL1  (secure flash, bp.secureflashloader = bl1.bin)
-     └─ BL2   (loaded from FIP in NOR flash0, bp.flashloader0 = fip.bin)
-         └─ BL31 (EL3 runtime: PSCI v1.1, GICv3 secure init, counter start)
-             └─ BL33 = EDK2 FVP_AARCH64_EFI.fd  (NS-EL2)
-                 └─ BDS → UEFI Shell (fallback boot option)
-                     └─ startup.nsh on SemihostFs (build/uefi/)
-                         └─ Image dtb=… console=…  (kernel EFI stub)
-                             └─ ExitBootServices → Linux at EL2
-                                 └─ PSCI CPU_ON (SMC → BL31) for CPU1
-```
-
-### Build pieces (`Makefile`, "UEFI" sections)
-
-| Piece | Source | Output |
-|---|---|---|
-| EDK2 | `tianocore/edk2` + `edk2-platforms`, pinned master SHAs (`EDK2_SHA`, `EDK2_PLAT_SHA`) | `build/Build/ArmVExpress-FVP-AArch64/RELEASE_GCC/FV/FVP_AARCH64_EFI.fd` |
-| TF-A | `v2.15.0`, `PLAT=fvp FVP_CLUSTER_COUNT=1 FVP_MAX_CPUS_PER_CLUSTER=2 CTX_INCLUDE_AARCH32_REGS=0 BL33=<EDK2 fd>` | `build/tf-a/build/fvp/release/{bl1,fip}.bin` |
-| Semihosting dir | `Image`, `fvp-base-revc-2core.dtb`, generated `startup.nsh` | `build/uefi/` |
-
-EDK2 build-time host tools (`uuid-dev`, `iasl`) come from
-`~/.local/uefi-tools` (see `script/0_env_var_setup.sh`).
-
-### Stages
-
-1. **TF-A (log lines 23–31).** BL1 → BL2 → BL31. (One earlier run,
-   before the PCD fix below, showed the TF-A banner twice, i.e. one warm
-   reset before EDK2's banner. The passing run shows it once; the cause
-   was not root-caused.) BL31 stays resident at EL3
-   as the PSCI provider and starts the system counter, so no
-   `refcounter` or `pctl.startup` model parameters are needed.
-2. **EDK2 / BDS (line 34).** `Press ESCAPE for boot options`, then the
-   BDS boot timeout expires. No device has a bootable ESP (the virtio
-   disk is a raw squashfs), so BDS boots the embedded UEFI Shell as its
-   fallback.
-3. **Shell (lines 34–59).** After a 5 s countdown, the Shell runs
-   `startup.nsh` from EDK2's SemihostFs, which exposes the model's
-   `semihosting-cwd` (`build/uefi/`).
-4. **EFI stub (lines 61–64).** `Image` is a PE/COFF EFI application
-   (`CONFIG_EFI_STUB=y`). The stub loads the dtb named by `dtb=` from
-   the same volume (`Using DTB from command line`), builds the memory
-   map, calls `ExitBootServices`, and enters the kernel at EL2.
-5. **Linux.** Compared with the boot-wrapper flow:
-   - `efi: EFI v2.7 by EDK II` instead of `UEFI not found`. EFI runtime
-     services are mapped (`Remapping and enabling EFI services`), and
-     `rtc-efi` registers as `rtc0`.
-   - `psci: PSCIv1.1 detected in firmware` (TF-A) instead of
-     boot-wrapper's v0.1 `CPU_ON`/`CPU_OFF` only.
-   - `efi: ACPI 2.0=…` is published by EDK2 but ignored
-     (`CONFIG_ACPI` off). Hardware still comes from our dtb.
-   - `KASLR disabled due to lack of seed` / `EFI_RNG_PROTOCOL
-     unavailable`: the FVP EDK2 build has no RNG protocol.
-   - `Unknown kernel command line parameters "dtb=…"` is harmless. The
-     stub consumes `dtb=`, and the kernel just passes it on to userspace.
-6. **SMP + userspace.** CPU1 is brought up by `PSCI CPU_ON` → BL31,
-   which powers it on through the FVP power controller (line 179). After
-   that, the `/init` → `ftrace_test.sh` flow is the same as for
-   `run-base`.
-
-### Required settings (root-caused live)
-
-- **`PcdUefiShellDefaultBootEnable=TRUE`** (EDK2 `build --pcd`). ArmPkg's
-  `PlatformBootManagerLib` registers the Shell as an *inactive* boot
-  option (hotkey `s` only). Without this PCD, BDS finds nothing to boot,
-  drops to the setup front page ("Device Manager / Boot Manager / …"),
-  and `startup.nsh` never runs.
-- **`CTX_INCLUDE_AARCH32_REGS=0`** (TF-A). With `cluster0.has_arm_v9-0=1`,
-  EL1 is AArch64-only. With the default of 1, BL1 prints `EL1 supports
-  AArch64-only…` and reset-loops forever.
-- **`FVP_CLUSTER_COUNT=1 FVP_MAX_CPUS_PER_CLUSTER=2`** (TF-A) matches
-  the model's `cluster0.NUM_CORES=2 cluster1.NUM_CORES=0` and our dts.
-- **No `-a`, no `pctl.startup`, no `refcounter` param** (model). BL1 is
-  the reset vector, TF-A expects only cpu0 at reset, and TF-A starts the
-  counter itself.
-- `sh: 1: xterm: not found` in the log is harmless. The FVP tries to
-  open terminal windows for UART1–3.
+  See "UEFI boot flow" above.
 
 ## Foundation Platform, 4 cores
 
